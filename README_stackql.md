@@ -80,6 +80,8 @@ static int (*const sqlite3BuiltinExtensions[])(sqlite3*) = {
 
 ### Building `stackql-go-sqlite3` 
 
+> ensure to update `go.mod` on `stackql-go-sqlite3` to change the module to `module github.com/stackql/stackql-go-sqlite3`
+
 To test compile `stackql-go-sqlite3`, run the following command:
 
 ```bash
@@ -94,8 +96,8 @@ go build --tags "sqlite_stackql" -o /dev/null
 git add .
 git commit -m "function updates"
 git push origin feature/stackql-ext-fns
-git tag v1.0.0-stackql
-git push origin v1.0.0-stackql
+git tag v1.0.1-stackql
+git push origin v1.0.1-stackql
 ```
 ### updating `go.mod` in `stackql`
 
