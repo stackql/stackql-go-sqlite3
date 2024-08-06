@@ -88,21 +88,15 @@ go build --tags "sqlite_stackql" -o /dev/null
 
 ## Deployment to StackQL
 
-`stackql-go-sqlite3` is pulled in via the CI processes for [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-devel`](https://github.com/stackql/stackql-devel) via git tags.  Tags should follow the convention below:  
-
-```bash
-v{sqlite_major_version}.{sqlite_minor_version}.{sqlite_patch_version}-stackql{YYYYMMDD}[-{seq_no}]
-```
-`seqno` is only used if more than one tag is pushed on a given day.  An example of the steps to add and push tags are shown here:  
+`stackql-go-sqlite3` is pulled in via the CI processes for [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-devel`](https://github.com/stackql/stackql-devel) via git tags.  Tags should use `semver` and increment `major`, `minor` and `patch` versions accordingly.  An example of the steps to add and push tags are shown here:  
 
 ```bash
 git add .
 git commit -m "function updates"
 git push origin feature/stackql-ext-fns
-git tag v3.45.1-stackql20240708
-git push origin v3.45.1-stackql20240708
+git tag v1.0.0-stackql
+git push origin v1.0.0-stackql
 ```
-
 ### updating `go.mod` in `stackql`
 
 In [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-devel`](https://github.com/stackql/stackql-devel), update `go.mod` to reflect the current tag for `stackql-go-sqlite3`, for example...
@@ -111,10 +105,14 @@ In [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-
 // ...
 require (
 // ...other stuff
-	github.com/stackql/stackql-go-sqlite3 v3.45.1-stackql20240708
+	github.com/stackql/stackql-go-sqlite3 v1.0.0-stackql
 // ...other stuff
 )
 // ...
 ```
+
+> note that the major version needs to be included in the module path
+
+run `go mod tidy` on `stackql/stackql` or `stackql/stackql-devel`.
 
 > Ensure tests are added and pass for any additional functions included.
