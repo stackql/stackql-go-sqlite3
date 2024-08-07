@@ -107,10 +107,11 @@ In [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-
 // ...
 require (
 // ...other stuff
-	github.com/stackql/stackql-go-sqlite3 v1.0.1-stackql
+	github.com/mattn/go-sqlite3 v1.0.2-stackql
 // ...other stuff
 )
 // ...
+replace github.com/mattn/go-sqlite3 => github.com/stackql/stackql-go-sqlite3 v1.0.2-stackql
 ```
 
 > note that the major version needs to be included in the module path
