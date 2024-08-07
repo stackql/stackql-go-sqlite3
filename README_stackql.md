@@ -96,8 +96,8 @@ go build --tags "sqlite_stackql" -o /dev/null
 git add .
 git commit -m "function updates"
 git push origin feature/stackql-ext-fns
-git tag v1.0.1-stackql
-git push origin v1.0.1-stackql
+git tag v1.0.2-stackql
+git push origin v1.0.2-stackql
 ```
 ### updating `go.mod` in `stackql`
 
@@ -107,7 +107,7 @@ In [`stackql/stackql`](https://github.com/stackql/stackql) or [`stackql/stackql-
 // ...
 require (
 // ...other stuff
-	github.com/stackql/stackql-go-sqlite3 v1.0.0-stackql
+	github.com/stackql/stackql-go-sqlite3 v1.0.1-stackql
 // ...other stuff
 )
 // ...
