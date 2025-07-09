@@ -178151,11 +178151,29 @@ SQLITE_PRIVATE int sqlite3StmtVtabInit(sqlite3*);
 #ifdef SQLITE_EXTRA_AUTOEXT
 int SQLITE_EXTRA_AUTOEXT(sqlite3*);
 #endif
+// CUSTOM_EXTENSIONS
+// 1. Add custom extension initializer function declarations here...
+#ifdef SQLITE_ENABLE_STACKQL
+SQLITE_PRIVATE int sqlite3_jsonequal_init(sqlite3*, char**, const sqlite3_api_routines*);
+SQLITE_PRIVATE int sqlite3_regexp_init(sqlite3*, char**, const sqlite3_api_routines*);
+SQLITE_PRIVATE int sqlite3_splitpart_init(sqlite3*, char**, const sqlite3_api_routines*);
+SQLITE_PRIVATE int sqlite3_awspolicyequal_init(sqlite3*, char**, const sqlite3_api_routines*);
+#endif
+// End CUSTOM_EXTENSIONS
 /*
 ** An array of pointers to extension initializer functions for
 ** built-in extensions.
 */
 static int (*const sqlite3BuiltinExtensions[])(sqlite3*) = {
+// CUSTOM_EXTENSIONS
+// 2. Include custom extension initializer functions here...
+#ifdef SQLITE_ENABLE_STACKQL
+  (int(*)(sqlite3*))sqlite3_jsonequal_init,
+  (int(*)(sqlite3*))sqlite3_regexp_init,
+  (int(*)(sqlite3*))sqlite3_splitpart_init,
+  (int(*)(sqlite3*))sqlite3_awspolicyequal_init,
+#endif
+// End CUSTOM_EXTENSIONS  
 #ifdef SQLITE_ENABLE_FTS3
   sqlite3Fts3Init,
 #endif
@@ -256038,3 +256056,724 @@ int sqlite3_user_delete(
 }
 
 #endif /* SQLITE_USER_AUTHENTICATION */
+
+// CUSTOM_EXTENSIONS
+// 3. Add custom extension initializer functions here...
+#ifdef SQLITE_ENABLE_STACKQL
+
+/*
+** aws_policy_equal(POLICY1, POLICY2)
+**
+** This function compares two AWS IAM policy JSON strings and returns true if they are semantically equivalent
+** according to AWS IAM policy evaluation rules, false otherwise.
+**
+** Key Features:
+** - Supports comparison of AWS IAM policy documents
+** - Treats arrays in certain contexts (Principal, Action, Resource, etc.) as unordered sets
+** - Handles case-insensitive service names in ARNs
+** - Normalized comparison of AWS policy elements according to AWS evaluation logic
+**
+** Usage Examples:
+**   // Policy comparisons:
+**   SELECT aws_policy_equal(
+**     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}',
+**     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}'
+**   ); -- Returns 1 (true)
+**
+**   // Order-insensitive comparisons:
+**   SELECT aws_policy_equal(
+**     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn1","arn2"]}}]}',
+**     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn2","arn1"]}}]}'
+**   ); -- Returns 1 (true)
+**
+** This function is part of the StackQL extension suite for SQLite, providing AWS policy comparison capabilities.
+*/
+
+#include <math.h>
+#include <float.h>
+#include <string.h>
+#include <ctype.h>
+
+#include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT1
+
+#include "cJSON.h"
+
+// List of fields that should be compared as unordered sets
+static const char *unordered_arrays[] = {
+    "Action", "NotAction", "Resource", "NotResource", "Principal", "NotPrincipal", "AWS", "Service"
+};
+
+// Count of unordered array fields
+#define UNORDERED_ARRAYS_COUNT (sizeof(unordered_arrays) / sizeof(unordered_arrays[0]))
+
+// Forward declarations
+static cJSON_bool aws_policy_compare_items(const cJSON *a, const cJSON *b, int parent_is_unordered);
+
+// Check if a field name is in the list of unordered arrays
+static int is_unordered_array(const char *field_name) {
+    for (int i = 0; i < UNORDERED_ARRAYS_COUNT; i++) {
+        if (strcmp(field_name, unordered_arrays[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Case-insensitive string comparison for service names in ARNs
+static int aws_service_compare(const char *str1, const char *str2) {
+    if (str1 == NULL || str2 == NULL) {
+        return str1 == str2;
+    }
+    
+    while (*str1 && *str2) {
+        char c1 = tolower((unsigned char)*str1);
+        char c2 = tolower((unsigned char)*str2);
+        if (c1 != c2) {
+            return 0;
+        }
+        str1++;
+        str2++;
+    }
+    
+    return *str1 == *str2;
+}
+
+// Compare doubles with appropriate epsilon
+static cJSON_bool compare_double(double a, double b) {
+    double maxVal = fabs(a) > fabs(b) ? fabs(a) : fabs(b);
+    return (fabs(a - b) <= maxVal * DBL_EPSILON);
+}
+
+// Find an element in an array by value (for unordered comparison)
+static cJSON *find_matching_element(const cJSON *array, const cJSON *item, int parent_is_unordered) {
+    cJSON *element;
+    
+    // Nothing to find in empty arrays
+    if (array == NULL || item == NULL) {
+        return NULL;
+    }
+    
+    // Check each element in the array
+    cJSON_ArrayForEach(element, array) {
+        // For unordered arrays, use our specialized comparison
+        if (aws_policy_compare_items(element, item, parent_is_unordered)) {
+            return element;
+        }
+    }
+    
+    return NULL;
+}
+
+// Specialized comparison for AWS policy JSON elements
+static cJSON_bool aws_policy_compare_items(const cJSON *a, const cJSON *b, int parent_is_unordered) {
+    // If items are the same pointer, they're equal
+    if (a == b) {
+        return 1;
+    }
+    
+    // If either is NULL or they have different types, they're not equal
+    if ((a == NULL) || (b == NULL)) {
+        return 0;
+    }
+    
+    // Special case for comparing array with single value
+    if (((a->type & 0xFF) == cJSON_Array && (b->type & 0xFF) == cJSON_String) ||
+        ((a->type & 0xFF) == cJSON_String && (b->type & 0xFF) == cJSON_Array)) {
+        
+        const cJSON *array = ((a->type & 0xFF) == cJSON_Array) ? a : b;
+        const cJSON *string = ((a->type & 0xFF) == cJSON_String) ? a : b;
+        
+        // Only valid if array has exactly one element
+        if (cJSON_GetArraySize(array) != 1) {
+            return 0;
+        }
+        
+        // Compare the single array element with the string
+        return aws_policy_compare_items(cJSON_GetArrayItem(array, 0), string, parent_is_unordered);
+    }
+    
+    // Normal case - types must match
+    if ((a->type & 0xFF) != (b->type & 0xFF)) {
+        return 0;
+    }
+    
+    // Based on the item type, do specific comparisons
+    switch (a->type & 0xFF) {
+        // For simple types, use standard comparison
+        case cJSON_False:
+        case cJSON_True:
+        case cJSON_NULL:
+            return 1;
+            
+        case cJSON_Number:
+            return compare_double(a->valuedouble, b->valuedouble);
+            
+        case cJSON_String:
+        case cJSON_Raw:
+            if ((a->valuestring == NULL) || (b->valuestring == NULL)) {
+                return 0;
+            }
+            
+            // For service names or ARNs, do case-insensitive comparison
+            if (parent_is_unordered && (strstr(a->valuestring, "arn:") == a->valuestring)) {
+                return aws_service_compare(a->valuestring, b->valuestring);
+            } else {
+                return strcmp(a->valuestring, b->valuestring) == 0;
+            }
+            
+        case cJSON_Array:
+            {
+                cJSON *a_element = NULL;
+                cJSON *b_element = NULL;
+                int element_count = 0;
+                int matched_elements = 0;
+                int is_unordered = parent_is_unordered;
+                
+                // Count the elements in array a
+                cJSON_ArrayForEach(a_element, a) {
+                    element_count++;
+                }
+                
+                // Check if arrays have the same number of elements
+                if (element_count != cJSON_GetArraySize(b)) {
+                    return 0;
+                }
+                
+                // If this is an unordered array, each element in A must exist in B
+                if (is_unordered) {
+                    cJSON_ArrayForEach(a_element, a) {
+                        b_element = find_matching_element(b, a_element, is_unordered);
+                        if (b_element != NULL) {
+                            matched_elements++;
+                        } else {
+                            return 0;
+                        }
+                    }
+                    return matched_elements == element_count;
+                } else {
+                    // For ordered arrays, compare elements in order
+                    a_element = a->child;
+                    b_element = b->child;
+                    
+                    while (a_element != NULL && b_element != NULL) {
+                        if (!aws_policy_compare_items(a_element, b_element, is_unordered)) {
+                            return 0;
+                        }
+                        a_element = a_element->next;
+                        b_element = b_element->next;
+                    }
+                    
+                    // If we reached the end of both arrays, they're equal
+                    return (a_element == NULL && b_element == NULL);
+                }
+            }
+            
+        case cJSON_Object:
+            {
+                cJSON *a_element = NULL;
+                cJSON *b_element = NULL;
+                
+                // Each property in A must exist in B with equivalent value
+                cJSON_ArrayForEach(a_element, a) {
+                    // Check if we should treat arrays in this field as unordered
+                    int field_is_unordered = is_unordered_array(a_element->string);
+                    
+                    // Get matching property from B
+                    b_element = cJSON_GetObjectItem(b, a_element->string);
+                    
+                    // If property doesn't exist or values don't match, objects aren't equal
+                    if ((b_element == NULL) || !aws_policy_compare_items(a_element, b_element, field_is_unordered)) {
+                        return 0;
+                    }
+                }
+                
+                // Each property in B must exist in A
+                cJSON_ArrayForEach(b_element, b) {
+                    a_element = cJSON_GetObjectItem(a, b_element->string);
+                    if (a_element == NULL) {
+                        return 0;
+                    }
+                }
+                
+                return 1;
+            }
+            
+        default:
+            return 0;
+    }
+}
+
+static void aws_policy_equal(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) {
+        sqlite3_result_error(context, "aws_policy_equal() requires exactly two arguments", -1);
+        return;
+    }
+
+    const char *policy1 = (const char *)sqlite3_value_text(argv[0]);
+    const char *policy2 = (const char *)sqlite3_value_text(argv[1]);
+
+    if (policy1 == NULL || policy2 == NULL) {
+        sqlite3_result_error(context, "Invalid policy strings", -1);
+        return;
+    }
+
+    // If the strings are identical, they're equal (shortcut)
+    if (strcmp(policy1, policy2) == 0) {
+        sqlite3_result_int(context, 1);
+        return;
+    }
+
+    cJSON *policy_obj1 = cJSON_Parse(policy1);
+    cJSON *policy_obj2 = cJSON_Parse(policy2);
+
+    if (policy_obj1 == NULL || policy_obj2 == NULL) {
+        sqlite3_result_error(context, "Error parsing policy JSON strings", -1);
+        cJSON_Delete(policy_obj1);
+        cJSON_Delete(policy_obj2);
+        return;
+    }
+
+    // Compare the policies using our specialized comparison
+    cJSON_bool result = aws_policy_compare_items(policy_obj1, policy_obj2, 0);
+
+    cJSON_Delete(policy_obj1);
+    cJSON_Delete(policy_obj2);
+
+    sqlite3_result_int(context, result);
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+
+int sqlite3_awspolicyequal_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    SQLITE_EXTENSION_INIT2(pApi)
+    sqlite3_create_function(db, "aws_policy_equal", 2, SQLITE_UTF8, NULL, aws_policy_equal, NULL, NULL);
+    return SQLITE_OK;
+}
+
+/*
+** json_equal(JSON1, JSON2)
+**
+** This function compares two JSON strings and returns true if they are equivalent, false otherwise.
+** It is built using the cJSON library by Dave Gamble (https://github.com/DaveGamble/cJSON). 
+**
+** Key Features:
+** - Supports comparison of JSON objects and arrays.
+** - Treats JSON objects with keys in different orders as equivalent, as per the JSON specification.
+**
+** Usage Examples:
+**   // Object comparisons:
+**   SELECT json_equal('{"key": "value"}', '{"key": "value"}'); -- Returns 1 (true)
+**   SELECT json_equal('{"key1": "value1", "key2": "value2"}', '{"key2": "value2", "key1": "value1"}'); -- Returns 1 (true)
+**   SELECT json_equal('{"key": "value"}', '{"key": "different"}'); -- Returns 0 (false)
+**
+**   // Array comparisons:
+**   SELECT json_equal('[1, 2, 3]', '[1, 2, 3]'); -- Returns 1 (true)
+**   SELECT json_equal('[1, 2, 3]', '[3, 2, 1]'); -- Returns 0 (false)
+**   SELECT json_equal('[{"key": "value"}]', '[{"key": "value"}]'); -- Returns 1 (true)
+**
+** This function is part of the StackQL extension suite for SQLite, providing enhanced JSON handling capabilities.
+*/
+
+#include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT1
+
+#include "cJSON.h"
+
+static void json_equal(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) {
+        sqlite3_result_error(context, "json_equal() requires exactly two arguments", -1);
+        return;
+    }
+
+    const char *json1 = (const char *)sqlite3_value_text(argv[0]);
+    const char *json2 = (const char *)sqlite3_value_text(argv[1]);
+
+    if (json1 == NULL || json2 == NULL) {
+        sqlite3_result_error(context, "Invalid JSON strings", -1);
+        return;
+    }
+
+    cJSON *json_obj1 = cJSON_Parse(json1);
+    cJSON *json_obj2 = cJSON_Parse(json2);
+
+    if (json_obj1 == NULL || json_obj2 == NULL) {
+        sqlite3_result_error(context, "Error parsing JSON strings", -1);
+        cJSON_Delete(json_obj1);
+        cJSON_Delete(json_obj2);
+        return;
+    }
+
+    cJSON_bool result = cJSON_Compare(json_obj1, json_obj2, cJSON_True);
+
+    cJSON_Delete(json_obj1);
+    cJSON_Delete(json_obj2);
+
+    sqlite3_result_int(context, result);
+}
+
+int sqlite3_jsonequal_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    SQLITE_EXTENSION_INIT2(pApi)
+    sqlite3_create_function(db, "json_equal", 2, SQLITE_UTF8, NULL, json_equal, NULL, NULL);
+    return SQLITE_OK;
+}
+
+/*
+** SQLite extensions for working with regular expressions using https://github.com/kokke/tiny-regex-c.
+**
+** This extension provides functions for pattern matching and manipulation of strings
+** using regular expressions. It is built using the tiny-regex-c library by Kristian Evensen,
+** which offers a minimalistic and efficient implementation of regular expressions in C.
+**
+** Provided Functions:
+** - regexp_like(source, pattern)
+**   - Checks if the source string matches the pattern.
+**
+** - regexp_substr(source, pattern)
+**   - Returns the substring of the source that matches the pattern.
+**
+** - regexp_replace(source, pattern, replacement)
+**   - Replaces the matching substring with the replacement string.
+**
+** Supported Regular Expression Syntax:
+**   - X*      Zero or more occurrences of X
+**   - X+      One or more occurrences of X
+**   - X?      Zero or one occurrences of X
+**   - (X)     Match X
+**   - X|Y     X or Y
+**   - ^X      X occurring at the beginning of the string
+**   - X$      X occurring at the end of the string
+**   - .       Match any single character
+**   - \c      Character c where c is one of \{}()[]|*+?.
+**   - \c      C-language escapes for c in afnrtv, e.g., \t or \n
+**   - [abc]   Any single character from the set abc
+**   - [^abc]  Any single character not in the set abc
+**   - [a-z]   Any single character in the range a-z
+**   - [^a-z]  Any single character not in the range a-z
+**
+** This extension is part of the StackQL suite for SQLite, offering enhanced string manipulation capabilities.
+*/
+
+#include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT1
+
+#include "re.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>  // For snprintf
+
+static void regexp_like(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) {
+        sqlite3_result_error(context, "regexp_like() requires exactly two arguments", -1);
+        return;
+    }
+
+    const char *str = (const char *)sqlite3_value_text(argv[0]);
+    const char *pattern = (const char *)sqlite3_value_text(argv[1]);
+
+    if (str == NULL || pattern == NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+
+    re_t regex = re_compile(pattern);
+    if (regex == NULL) {
+        sqlite3_result_error(context, "Invalid regular expression", -1);
+        return;
+    }
+
+    int match_len;
+    int match = re_matchp(regex, str, &match_len);
+    sqlite3_result_int(context, match != -1);  // Return 1 if match, 0 if not
+}
+
+static void regexp_replace(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 3) {
+        sqlite3_result_error(context, "regexp_replace() requires exactly three arguments", -1);
+        return;
+    }
+
+    const char *str = (const char *)sqlite3_value_text(argv[0]);
+    const char *pattern = (const char *)sqlite3_value_text(argv[1]);
+    const char *replacement = (const char *)sqlite3_value_text(argv[2]);
+
+    if (str == NULL || pattern == NULL || replacement == NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+
+    re_t regex = re_compile(pattern);
+    if (regex == NULL) {
+        sqlite3_result_error(context, "Invalid regular expression", -1);
+        return;
+    }
+
+    char *result = NULL;
+    size_t len = 0;
+    const char *cursor = str;
+    int match_len;
+    int match_start;
+
+    while ((match_start = re_matchp(regex, cursor, &match_len)) != -1) {
+        size_t prefix_len = match_start;
+        size_t suffix_len = strlen(cursor + match_start + match_len);
+        size_t rep_len = strlen(replacement);
+
+        char *temp = realloc(result, len + prefix_len + rep_len + suffix_len + 1);
+        if (!temp) {
+            sqlite3_result_error_nomem(context);
+            free(result);
+            return;
+        }
+
+        result = temp;
+        memcpy(result + len, cursor, prefix_len);
+        len += prefix_len;
+        memcpy(result + len, replacement, rep_len);
+        len += rep_len;
+        cursor += match_start + match_len;
+    }
+
+    if (result) {
+        strcpy(result + len, cursor);
+        sqlite3_result_text(context, result, -1, free);
+    } else {
+        sqlite3_result_text(context, str, -1, SQLITE_TRANSIENT);
+    }
+}
+
+static void regexp_substr(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) {
+        sqlite3_result_error(context, "regexp_substr() requires exactly two arguments", -1);
+        return;
+    }
+
+    const char *str = (const char *)sqlite3_value_text(argv[0]);
+    const char *pattern = (const char *)sqlite3_value_text(argv[1]);
+
+    if (str == NULL || pattern == NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+
+    re_t regex = re_compile(pattern);
+    if (regex == NULL) {
+        sqlite3_result_error(context, "Invalid regular expression", -1);
+        return;
+    }
+
+    int match_len;
+    int match_start = re_matchp(regex, str, &match_len);
+    if (match_start != -1) {
+        char *match_str = (char *)malloc(match_len + 1);
+        if (!match_str) {
+            sqlite3_result_error_nomem(context);
+            return;
+        }
+
+        strncpy(match_str, str + match_start, match_len);
+        match_str[match_len] = '\0';
+        sqlite3_result_text(context, match_str, -1, free);
+    } else {
+        sqlite3_result_null(context);
+    }
+}
+
+int sqlite3_regexp_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    SQLITE_EXTENSION_INIT2(pApi)
+    int rc = SQLITE_OK;
+
+    rc = sqlite3_create_function(db, "regexp_like", 2, SQLITE_UTF8, NULL, regexp_like, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = sqlite3_create_function(db, "regexp_replace", 3, SQLITE_UTF8, NULL, regexp_replace, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = sqlite3_create_function(db, "regexp_substr", 2, SQLITE_UTF8, NULL, regexp_substr, NULL, NULL);
+    return rc;
+}
+
+/*
+** split_part(source, separator, part)
+**
+** This function splits a given string (`source`) into parts using a specified `separator`
+** and returns the part indexed by `part`. The function supports both positive (one-based)
+** and negative indexing, allowing flexible retrieval of string segments.
+**
+** Parameters:
+** - source (string): The input string to be split.
+** - separator (string): The character or string used to divide the source into parts.
+** - part (integer): The one-based index of the part to return. Supports negative indexing:
+**   - Positive Index: Counts from the start of the string, where 1 is the first part.
+**   - Negative Index: Counts backward from the end of the string, where -1 is the last part.
+**
+** Returns:
+** - The specified part of the source string if it exists; otherwise, NULL.
+**
+** Note:
+** - Consecutive separators will result in empty string parts being included.
+**
+** Examples:
+**   SELECT split_part('https://www.googleapis.com/compute/v1/projects/testing-project/global/networks/default', '/', 1);
+**   -- Returns: 'https:'
+**
+**   SELECT split_part('https://www.googleapis.com/compute/v1/projects/testing-project/global/networks/default', '/', 3);
+**   -- Returns: 'compute'
+**
+**   SELECT split_part('https://www.googleapis.com/compute/v1/projects/testing-project/global/networks/default', '/', 8);
+**   -- Returns: 'networks'
+**
+**   SELECT split_part('https://www.googleapis.com/compute/v1/projects/testing-project/global/networks/default', '/', -1);
+**   -- Returns: 'default'
+**
+**   SELECT split_part('https://www.googleapis.com/compute/v1/projects/testing-project/global/networks/default', '/', -3);
+**   -- Returns: 'global'
+**
+** This function is part of the StackQL extension suite for SQLite, providing enhanced string manipulation capabilities.
+*/
+
+#include <sqlite3ext.h>
+SQLITE_EXTENSION_INIT1
+
+#include <string.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+// Custom implementation of strndup for Windows
+char* strndup(const char* s, size_t n) {
+    size_t len = strlen(s);
+    if (len > n) {
+        len = n;
+    }
+    char* result = (char*)malloc(len + 1);
+    if (!result) return NULL;
+    result[len] = '\0';
+    return (char*)memcpy(result, s, len);
+}
+#endif
+
+// Helper function to split a string and return the specified part
+static void split_part(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 3) {
+        sqlite3_result_error(context, "split_part() requires exactly three arguments", -1);
+        return;
+    }
+
+    const char *source = (const char *)sqlite3_value_text(argv[0]);
+    const char *sep = (const char *)sqlite3_value_text(argv[1]);
+    int part = sqlite3_value_int(argv[2]);
+
+    if (source == NULL || sep == NULL || *sep == '\0') {
+        sqlite3_result_null(context);
+        return;
+    }
+
+    // Calculate separator length
+    size_t sep_len = strlen(sep);
+
+    // Create a mutable copy of the source string
+    char *copy = strdup(source);
+    if (!copy) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+
+    // Initialize parts list
+    char **parts = NULL;
+    int count = 0;
+    char *current = copy;
+    char *next;
+
+    // Parse the string
+    while ((next = strstr(current, sep)) != NULL) {
+        size_t token_len = next - current;
+
+        // Allocate space for the new part
+        char **temp = realloc(parts, sizeof(char*) * (count + 1));
+        if (!temp) {
+            sqlite3_result_error_nomem(context);
+            free(copy);
+            for (int i = 0; i < count; ++i) {
+                free(parts[i]);
+            }
+            free(parts);
+            return;
+        }
+        parts = temp;
+
+        // Allocate and copy the token
+        parts[count] = strndup(current, token_len);
+        if (!parts[count]) {
+            sqlite3_result_error_nomem(context);
+            free(copy);
+            for (int i = 0; i < count; ++i) {
+                free(parts[i]);
+            }
+            free(parts);
+            return;
+        }
+        count++;
+        
+        // Move past the separator
+        current = next + sep_len;
+    }
+
+    // Handle the last part (after the last separator)
+    char **temp = realloc(parts, sizeof(char*) * (count + 1));
+    if (!temp) {
+        sqlite3_result_error_nomem(context);
+        free(copy);
+        for (int i = 0; i < count; ++i) {
+            free(parts[i]);
+        }
+        free(parts);
+        return;
+    }
+    parts = temp;
+    parts[count] = strdup(current);
+    if (!parts[count]) {
+        sqlite3_result_error_nomem(context);
+        free(copy);
+        for (int i = 0; i < count; ++i) {
+            free(parts[i]);
+        }
+        free(parts);
+        return;
+    }
+    count++;
+
+    // Adjust the part index for one-based and negative indexing
+    if (part < 0) {
+        part = count + part;
+    } else {
+        part = part - 1;
+    }
+
+    // Return the requested part if it's in range
+    if (part >= 0 && part < count) {
+        sqlite3_result_text(context, parts[part], -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_result_null(context);
+    }
+
+    // Free allocated memory
+    for (int i = 0; i < count; ++i) {
+        free(parts[i]);
+    }
+    free(parts);
+    free(copy);
+}
+
+int sqlite3_splitpart_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+    SQLITE_EXTENSION_INIT2(pApi)
+    int rc = SQLITE_OK;
+
+    rc = sqlite3_create_function(db, "split_part", 3, SQLITE_UTF8, NULL, split_part, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    return rc;
+}
+#endif // #ifdef SQLITE_ENABLE_STACKQL
+// End CUSTOM_EXTENSIONS 
