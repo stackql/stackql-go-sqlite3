@@ -256069,7 +256069,8 @@ int sqlite3_user_delete(
 **
 ** Key Features:
 ** - Supports comparison of AWS IAM policy documents
-** - Treats arrays in certain contexts (Principal, Action, Resource, etc.) as unordered sets
+** - Treats arrays in certain contexts (Principal, Action, Resource, Tags, etc.) as unordered sets
+** - When both arguments are top-level JSON arrays (e.g. raw tags arrays), compares them as unordered sets
 ** - Handles case-insensitive service names in ARNs
 ** - Normalized comparison of AWS policy elements according to AWS evaluation logic
 **
@@ -256084,6 +256085,18 @@ int sqlite3_user_delete(
 **   SELECT aws_policy_equal(
 **     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn1","arn2"]}}]}',
 **     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn2","arn1"]}}]}'
+**   ); -- Returns 1 (true)
+**
+**   // Top-level tags array comparisons (AWS does not guarantee tag order):
+**   SELECT aws_policy_equal(
+**     '[{"Key":"env","Value":"prod"},{"Key":"team","Value":"platform"}]',
+**     '[{"Key":"team","Value":"platform"},{"Key":"env","Value":"prod"}]'
+**   ); -- Returns 1 (true)
+**
+**   // Tags field nested inside a resource object:
+**   SELECT aws_policy_equal(
+**     '{"BucketName":"my-bucket","Tags":[{"Key":"env","Value":"prod"},{"Key":"team","Value":"platform"}]}',
+**     '{"BucketName":"my-bucket","Tags":[{"Key":"team","Value":"platform"},{"Key":"env","Value":"prod"}]}'
 **   ); -- Returns 1 (true)
 **
 ** This function is part of the StackQL extension suite for SQLite, providing AWS policy comparison capabilities.
@@ -256101,7 +256114,8 @@ SQLITE_EXTENSION_INIT1
 
 // List of fields that should be compared as unordered sets
 static const char *unordered_arrays[] = {
-    "Action", "NotAction", "Resource", "NotResource", "Principal", "NotPrincipal", "AWS", "Service"
+    "Action", "NotAction", "Resource", "NotResource", "Principal", "NotPrincipal", "AWS", "Service",
+    "Tags", "tags"
 };
 
 // Count of unordered array fields
@@ -256334,8 +256348,12 @@ static void aws_policy_equal(sqlite3_context *context, int argc, sqlite3_value *
         return;
     }
 
+    // If both top-level items are arrays, treat them as unordered sets (e.g. Tags arrays)
+    int top_level_unordered = ((policy_obj1->type & 0xFF) == cJSON_Array) &&
+                              ((policy_obj2->type & 0xFF) == cJSON_Array);
+
     // Compare the policies using our specialized comparison
-    cJSON_bool result = aws_policy_compare_items(policy_obj1, policy_obj2, 0);
+    cJSON_bool result = aws_policy_compare_items(policy_obj1, policy_obj2, top_level_unordered);
 
     cJSON_Delete(policy_obj1);
     cJSON_Delete(policy_obj2);
